@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.kinova_policy as kinova_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -352,6 +353,63 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotKinovaDataConfig(DataConfigFactory):
+    """
+    Data config for the Kinova Gen3 6-DoF + Robotiq 2F-85 setup recorded with lerobot_ros.
+
+    Dataset layout (lerobot v2.1):
+      observation.images.external  -> base_rgb   (640x480, RealSense D435)
+      observation.images.wrist     -> wrist_rgb  (320x240, Kinova wrist cam)
+      observation.state            -> state      (7-DOF: joints 0-5 + knuckle position, continuous)
+      action                       -> actions    (7-DOF: joints 0-5 absolute + gripper command 0.0/0.8)
+
+    Arm joints (0:6) are recorded as absolute positions, so DeltaActions converts them to
+    deltas relative to the current state, matching AbsoluteActions in serve_kinova.py at
+    inference time. Gripper dim (index 6) is the discrete command and stays absolute.
+    """
+
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap LeRobot dataset keys to the keys KinovaInputs expects.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_rgb": "observation.images.external",
+                        "wrist_rgb": "observation.images.wrist",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Arm joints (0:6) as delta, gripper (index 6) as absolute — must match serve_kinova.py.
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = _transforms.Group(
+            inputs=[kinova_policy.KinovaInputs(model_type=model_config.model_type)],
+            outputs=[kinova_policy.KinovaOutputs()],
+        ).push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # Must match the actual dataset key (lerobot v2.1 uses "action", not "actions").
+            action_sequence_keys=("action",),
         )
 
 
@@ -964,6 +1022,155 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    # ---------------------------------------------------------------------------
+    # Kinova Gen3 6-DoF + Robotiq 2F-85, cubelift dataset.
+    #
+    # Two norm-stat strategies are provided — try both and keep the better one:
+    #
+    #   pi0_kinova_finetune          — fresh stats computed from our dataset.
+    #                                  Run: uv run scripts/compute_norm_stats.py pi0_kinova_finetune
+    #
+    #   pi0_kinova_finetune_ur5e     — reuse pi0_base ur5e pre-training stats.
+    #                                  Same arm DOF + Robotiq 2F-85 as our setup, so the
+    #                                  model already "knows" this action distribution.
+    #                                  Note: ur5e stats expect gripper in [0,1]; ours is
+    #                                  [0, 0.8] rad, so one dimension will be slightly off.
+    #
+    # Both have LoRA variants (_lora suffix) for servers with < 70 GB VRAM.
+    # ---------------------------------------------------------------------------
+
+    # Full fine-tune, fresh norm stats.
+    TrainConfig(
+        name="pi0_kinova_finetune",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Full fine-tune, reuse ur5e pre-training norm stats (no compute_norm_stats needed).
+    TrainConfig(
+        name="pi0_kinova_finetune_ur5e",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    # LoRA fine-tune, fresh norm stats (< 70 GB VRAM).
+    TrainConfig(
+        name="pi0_kinova_finetune_lora",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # LoRA fine-tune, reuse ur5e pre-training norm stats (< 70 GB VRAM, no compute_norm_stats needed).
+    TrainConfig(
+        name="pi0_kinova_finetune_lora_ur5e",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ---------------------------------------------------------------------------
+    # pi0.5 variants (same dataset, same four norm-stat strategies).
+    # pi0.5 differences vs pi0: state is fed as discrete language tokens
+    # (discrete_state_input=True by default), max_token_len=200.
+    # Checkpoint: gs://openpi-assets/checkpoints/pi05_base/params
+    #
+    # Note on ur5e assets for pi0.5: norm_stats.md only explicitly lists ur5e
+    # for pi0_base / pi0_fast_base. The _ur5e variants below point to
+    # pi05_base/assets — verify that asset_id="ur5e" exists there before use.
+    # ---------------------------------------------------------------------------
+
+    # Full fine-tune, fresh norm stats.
+    # Run: uv run scripts/compute_norm_stats.py pi05_kinova_finetune
+    TrainConfig(
+        name="pi05_kinova_finetune",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Full fine-tune, reuse ur5e pre-training norm stats.
+    TrainConfig(
+        name="pi05_kinova_finetune_ur5e",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # LoRA fine-tune, fresh norm stats (< 70 GB VRAM).
+    TrainConfig(
+        name="pi05_kinova_finetune_lora",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # LoRA fine-tune, reuse ur5e pre-training norm stats (< 70 GB VRAM).
+    TrainConfig(
+        name="pi05_kinova_finetune_lora_ur5e",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
