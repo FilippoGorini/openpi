@@ -1043,7 +1043,7 @@ _CONFIGS = [
     # Full fine-tune, fresh norm stats.
     TrainConfig(
         name="pi0_kinova_finetune",
-        model=pi0_config.Pi0Config(),
+        model=pi0_config.Pi0Config(action_horizon=30),  # 30 steps @ 30 Hz = 1 s replan period
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             base_config=DataConfig(prompt_from_task=True),
@@ -1102,20 +1102,21 @@ _CONFIGS = [
     ),
     # ---------------------------------------------------------------------------
     # pi0.5 variants (same dataset, same four norm-stat strategies).
-    # pi0.5 differences vs pi0: state is fed as discrete language tokens
-    # (discrete_state_input=True by default), max_token_len=200.
+    # pi0.5 differences vs pi0: discrete_state_input=True by default (state fed
+    # as language tokens), max_token_len=200. We set discrete_state_input=False
+    # explicitly to match the pi05_libero reference (continuous joint state).
     # Checkpoint: gs://openpi-assets/checkpoints/pi05_base/params
     #
-    # Note on ur5e assets for pi0.5: norm_stats.md only explicitly lists ur5e
-    # for pi0_base / pi0_fast_base. The _ur5e variants below point to
-    # pi05_base/assets — verify that asset_id="ur5e" exists there before use.
+    # WARNING — _ur5e variants: if gs://openpi-assets/checkpoints/pi05_base/assets/ur5e
+    # does not exist, norm stats silently fail and training runs unnormalized.
+    # Confirm the path exists before using those configs. Prefer fresh-stats variants.
     # ---------------------------------------------------------------------------
 
     # Full fine-tune, fresh norm stats.
     # Run: uv run scripts/compute_norm_stats.py pi05_kinova_finetune
     TrainConfig(
         name="pi05_kinova_finetune",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             base_config=DataConfig(prompt_from_task=True),
@@ -1126,7 +1127,7 @@ _CONFIGS = [
     # Full fine-tune, reuse ur5e pre-training norm stats.
     TrainConfig(
         name="pi05_kinova_finetune_ur5e",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             assets=AssetsConfig(
@@ -1141,7 +1142,7 @@ _CONFIGS = [
     # LoRA fine-tune, fresh norm stats (< 70 GB VRAM).
     TrainConfig(
         name="pi05_kinova_finetune_lora",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             base_config=DataConfig(prompt_from_task=True),
@@ -1156,7 +1157,7 @@ _CONFIGS = [
     # LoRA fine-tune, reuse ur5e pre-training norm stats (< 70 GB VRAM).
     TrainConfig(
         name="pi05_kinova_finetune_lora_ur5e",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             assets=AssetsConfig(
