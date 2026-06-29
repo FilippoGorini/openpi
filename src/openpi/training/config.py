@@ -1054,7 +1054,7 @@ _CONFIGS = [
     # Full fine-tune, reuse ur5e pre-training norm stats (no compute_norm_stats needed).
     TrainConfig(
         name="pi0_kinova_finetune_ur5e",
-        model=pi0_config.Pi0Config(),
+        model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             assets=AssetsConfig(
@@ -1069,7 +1069,7 @@ _CONFIGS = [
     # LoRA fine-tune, fresh norm stats (< 70 GB VRAM).
     TrainConfig(
         name="pi0_kinova_finetune_lora",
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             base_config=DataConfig(prompt_from_task=True),
@@ -1084,7 +1084,7 @@ _CONFIGS = [
     # LoRA fine-tune, reuse ur5e pre-training norm stats (< 70 GB VRAM, no compute_norm_stats needed).
     TrainConfig(
         name="pi0_kinova_finetune_lora_ur5e",
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             assets=AssetsConfig(
