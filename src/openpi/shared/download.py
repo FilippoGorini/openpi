@@ -131,11 +131,16 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
         total_size = info["size"]
     with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fs.get, url, local_path, recursive=is_dir)
+        # Pass a str target: some fsspec backends (e.g. HfFileSystem for hf://) reject a
+        # pathlib.Path local target and raise inside the worker thread.
+        future = executor.submit(fs.get, url, str(local_path), recursive=is_dir)
         while not future.done():
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
             time.sleep(1)
+        # Surface any exception from the worker thread; otherwise a failed download is
+        # swallowed here and only shows up later as a misleading FileNotFoundError on move.
+        future.result()
         pbar.update(total_size - pbar.n)
 
 
