@@ -126,7 +126,12 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        # cond is (b, emb) for a single global conditioning (non RTC: one denoising time per sample broadcast across all tokens) 
+        # or (b, seq, emb) for per-position conditioning (training-time RTC: prefix positions get time 0, postfix get time t)
+        # Insert the broadcast axis only in the global case so both are supported. Params are identical so this should be backward-compatible
+        if modulation.ndim == 2:
+            modulation = modulation[:, None, :]
+        scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -392,7 +397,9 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        # `adarms_cond` is (b, _d) for global per-sample conditioning (non-RTC) or (b, _t, _d) for
+        # per-position conditioning (training-time RTC). Accept both, RMSNorm handles the shape
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _t _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
