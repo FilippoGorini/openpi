@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import inspect
 import logging
 import pathlib
 import time
@@ -60,14 +61,35 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # JAX model setup. RTC models (Pi0Faster) use jax.lax.scan(length=num_steps) and a static
+            # `infer_time_schedule` string, so those must be static args; the base Pi0 has neither and
+            # keeps its dynamic num_steps. Only mark static the args the method actually accepts, so the
+            # non-RTC path is unchanged.
+            sig_params = inspect.signature(model.sample_actions).parameters
+            if "infer_time_schedule" in sig_params:
+                static_argnames = tuple(
+                    n for n in ("num_steps", "infer_time_schedule", "alpha", "u0") if n in sig_params
+                )
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=static_argnames)
+            else:
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+
+        # RTC: if the client supplies a committed action prefix + inference delay,
+        # detect it BEFORE the input transform (which re-anchors/normalizes/pads action_prefix) and
+        # thread both into sample_actions. Absent both keys => standard inference, unchanged behaviour.
+        if "action_prefix" in inputs or "delay" in inputs:
+            assert "action_prefix" in inputs and "delay" in inputs, "action_prefix and delay must both be present"
+            assert not self._is_pytorch_model, "RTC (action_prefix/delay) is only supported for JAX models"
+            prefix_mode = True
+        else:
+            prefix_mode = False
+
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,6 +108,11 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        if prefix_mode:
+            # Transformed + batched: action_prefix is (1, ah, ad), delay is (1,).
+            sample_kwargs["delay"] = inputs["delay"]
+            sample_kwargs["action_prefix"] = inputs["action_prefix"]
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

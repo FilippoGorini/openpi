@@ -127,9 +127,15 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
+        norm_stats = self.norm_stats
+        # For RTC, we normalize the action prefix exactly as the actions, as they are the same space (same norm stats)
+        # This is only triggered when a prefix is supplied, e.g. during inference (during training the prefix is simply the first d actions of the groudn truth chunk)
+        if "action_prefix" in data and "action_prefix" not in norm_stats:
+            norm_stats = {**norm_stats, "action_prefix": norm_stats["actions"]}
+
         return apply_tree(
             data,
-            self.norm_stats,
+            norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
@@ -210,14 +216,23 @@ class DeltaActions(DataTransformFn):
     mask: Sequence[bool] | None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if ("actions" not in data and "action_prefix" not in data) or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = data["state"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+
+        if "actions" in data:
+            actions = data["actions"]
+            actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+            data["actions"] = actions
+
+        # RTC: reanchor the committed action prefix to the CURRENT observation state exactly like actions
+        if "action_prefix" in data:
+            action_prefix = data["action_prefix"].copy()
+            action_prefix[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+            data["action_prefix"] = action_prefix
 
         return data
 
@@ -329,11 +344,21 @@ class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 
     model_action_dim: int
+    # RTC: model action horizon, used only to pad the committed action prefix along the time axis
+    # (a client may send fewer than `action_horizon` committed steps). None => no horizon padding,
+    # which preserves the exact original behaviour for every non-RTC config.
+    model_action_horizon: int | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        # RTC: pad the committed prefix to the model action dim (and horizon, if provided) so it matches the (horizon, action_dim) shape sample_actions freezes into x_t
+        # Skip if no action prefix is given when not doing rtc
+        if "action_prefix" in data:
+            data["action_prefix"] = pad_to_dim(data["action_prefix"], self.model_action_dim, axis=-1)
+            if self.model_action_horizon is not None:
+                data["action_prefix"] = pad_to_dim(data["action_prefix"], self.model_action_horizon, axis=-2)
         return data
 
 

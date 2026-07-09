@@ -69,6 +69,13 @@ class KinovaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Both are absent for normal (non-RTC) training and inference, so this is a no-op there.
+        # Only if we're doing RTC: pass the committed action prefix plus measured/expected inference delay in controller steps
+        if "delay" in data:
+            inputs["delay"] = data["delay"]
+        if "action_prefix" in data:
+            inputs["action_prefix"] = data["action_prefix"]
+
         return inputs
 
 
