@@ -121,11 +121,15 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        # For serving with RTC, we need to also pass the action horizon so that the action prefix can be padded
+                        _transforms.PadStatesAndActions(
+                            model_config.action_dim, model_action_horizon=model_config.action_horizon
+                        ),
                     ],
                 )
             case _model.ModelType.PI05:
-                assert isinstance(model_config, pi0_config.Pi0Config)
+                # widened assert to accept the Pi0FasterConfig with pi05=True
+                assert isinstance(model_config, pi0_config.Pi0Config | pi0_config.Pi0FasterConfig)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -134,7 +138,9 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.PadStatesAndActions(
+                            model_config.action_dim, model_action_horizon=model_config.action_horizon
+                        ),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -1117,6 +1123,24 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_kinova_finetune",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Full fine-tune with TRAINING-TIME RTC, fresh norm stats
+    # Differently from the first run, in this we set the discrete_state_input=True, so that the model actually conditions on the state too
+    # In fact, in the pi05 path, when this is false the state is not used for conditioning anywhere, not discrete, not continuous (as pi0 does instead)
+    # On the 5090 cloud GPU server full roundtrip latency is on average ~140 ms ---> 4/5 steps at 30 Hz control rate
+    # Therefore, we set the max_delay on a conservative 8: during training the model learns to counteract latencies anywhere from 0 to 8 steps 
+    # We set instead mix_prob=0.0 to skip the HAS scheduling introduced by the FASTER paper and use a constant scheduling instead: while the faster reaction times are nice, our focus is on simpler less dynamic tasks
+    TrainConfig(
+        name="pi05_kinova_finetune_rtc",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=8, mix_prob=0.0
+        ),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
             base_config=DataConfig(prompt_from_task=True),
