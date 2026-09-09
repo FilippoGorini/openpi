@@ -138,10 +138,15 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # Instead of fetching "action_horizon" future timesteps starting from the randomly sampled frame, we fetch an additional number of frames
+    # in order to be able to shift the commanded trajectory and simulate the command--->state lag during training thanks to our new `transforms.ShiftActions`
+    # The transform slices the window back down to `action_horizon`. LeRobot clamps the extra offsets within the episode and flags them via `<key>_is_pad`, 
+    # so the wider window never crosses into a neighbouring episode
+    fetch_horizon = action_horizon + max(0, data_config.action_state_delay_fetch_extra)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(fetch_horizon)] for key in data_config.action_sequence_keys
         },
     )
 

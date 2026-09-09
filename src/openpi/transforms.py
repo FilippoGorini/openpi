@@ -260,6 +260,59 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ShiftActions(DataTransformFn):
+    """Training-time augmentation for the action-to-state delay (measured state lags the command).
+
+    Dataset has command == state (zero delay) but at inference the command leads the measured state
+    This transform advances the action window by a random delay `delta` (arm cols are linearly interpolated to the
+    fractional offset while the discrete gripper is floored) while the observation stays put, so after
+    `DeltaActions` action[0] is a future state (delta[0] ~= delta*v > 0) -- matching inference,
+    including the RTC committed prefix.
+
+    `delta` ~ U[shift_min, shift_max] fractional grid steps (continuous; shift_min > 0 on purpose).
+    Needs the dataset to fetch `action_horizon + ceil(shift_max) + 1` steps; slices back to
+    `action_horizon`. Skipped at inference and when shift_max <= 0. Must run first, before `KinovaInputs`
+    (which drops `action_is_pad`) and `DeltaActions`.
+    """
+
+    # Model's action horizon
+    action_horizon: int
+    # Action-to-state delay range expressed in (fractional) controller timesteps
+    shift_min: float
+    shift_max: float
+
+    def __call__(self, data: DataDict) -> DataDict:
+        pad = data.pop("action_is_pad", None)
+        actions = data.get("actions")
+        # At inference or when augmentation is disabled, return the standard (not extended) window without doing nothing
+        if actions is None or self.shift_max <= 0.0:
+            return data
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.shape[0] <= self.action_horizon:
+            return data
+
+        h = self.action_horizon
+        delta = float(np.random.uniform(self.shift_min, self.shift_max))
+        # Boundary guard: padding is a contiguous episode-end tail: keep the interpolation anchor on
+        # real frames so a window that ran off the end can never become an all-padding "jump to final
+        # pose" target. Largely redundant given a >=1 s end-of-episode still hold, but cheap.
+        if pad is not None:
+            pad = np.asarray(pad)
+            n_real = int(np.argmax(pad)) if bool(pad.any()) else len(pad)
+            max_anchor = float(max(0, n_real - 1))
+            if delta > max_anchor:
+                delta = max_anchor
+
+        m = int(np.floor(delta))
+        f = delta - m
+        # Linearly interpolate the arm columns to the fractional offset and floor the discrete gripper
+        arm = (1.0 - f) * actions[m : m + h, :6] + f * actions[m + 1 : m + 1 + h, :6]
+        gripper = actions[m : m + h, 6:]
+        data["actions"] = np.concatenate([arm, gripper], axis=1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False

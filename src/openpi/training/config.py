@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import math
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -87,6 +88,12 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Number of EXTRA future action steps to fetch beyond `action_horizon` so the
+    # `transforms.ShiftActions` training augmentation can advance + interpolate the command window
+    # (action-to-state delay simulation). 0 disables the extra fetch; the augmentation is only wired
+    # in by data configs that add the transform (see LeRobotKinovaDataConfig).
+    action_state_delay_fetch_extra: int = 0
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -380,9 +387,26 @@ class LeRobotKinovaDataConfig(DataConfigFactory):
 
     default_prompt: str | None = None
 
+    # Action-to-state delay augmentation (see transforms.ShiftActions). Per training sample, the
+    # action/command window is advanced by a delay drawn from a CONTINUOUS uniform on
+    # [action_state_delay_ms_min, action_state_delay_ms_max] and linearly interpolated to that
+    # fractional offset, while the observation stays put -- so action[0] becomes a (fractional) future
+    # state, matching the JTC low-pass delay at inference (the measured state lags the command). Set
+    # the band from the MEASURED command->state delay (e.g. 140-190 ms). Leave
+    # action_state_delay_ms_max=0.0 (default) to disable it entirely (no extra fetch, transform
+    # skipped). control_fps converts ms -> grid steps; it must match the dataset fps (30 Hz here) and
+    # is a plain value rather than a dataset-metadata lookup to avoid a load at serving.
+    action_state_delay_ms_min: float = 0.0
+    action_state_delay_ms_max: float = 0.0
+    control_fps: float = 30.0
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Remap LeRobot dataset keys to the keys KinovaInputs expects.
+        # Remap LeRobot dataset keys to the keys KinovaInputs expects. `action_is_pad` (added by
+        # LeRobot whenever delta_timestamps is used) is carried through so ShiftActions can keep the
+        # sliced window's anchor step on a real frame; RepackTransform would otherwise drop it. It is
+        # consumed by that transform and never reaches the model. Training-only: the repack is not
+        # applied at serving, so the missing key at inference is a non-issue.
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -391,16 +415,36 @@ class LeRobotKinovaDataConfig(DataConfigFactory):
                         "wrist_rgb": "observation.images.wrist",
                         "state": "observation.state",
                         "actions": "action",
+                        "action_is_pad": "action_is_pad",
                         "prompt": "prompt",
                     }
                 )
             ]
         )
 
+        # Convert the action-to-state delay band from ms to (fractional) grid steps. Interpolation is
+        # always on, so the fetch needs ceil(max) + 1 extra steps (the +1 is the upper interp neighbour)
+        shift_min = shift_max = 0.0
+        fetch_extra = 0
+        if self.action_state_delay_ms_max > 0.0:
+            shift_min = self.action_state_delay_ms_min / 1000.0 * self.control_fps
+            shift_max = self.action_state_delay_ms_max / 1000.0 * self.control_fps
+            fetch_extra = int(math.ceil(shift_max)) + 1
+
         # Arm joints (0:6) as delta, gripper (index 6) as absolute — must match serve_kinova.py.
         delta_action_mask = _transforms.make_bool_mask(6, -1)
+        # ShiftActions must slice the (extended) action window BEFORE KinovaInputs rebuilds the dict
+        # (which would drop action_is_pad) and before DeltaActions anchors the chunk, so it goes first
+        # It is skipped when the band is disabled and at serving (no extended window)
         data_transforms = _transforms.Group(
-            inputs=[kinova_policy.KinovaInputs(model_type=model_config.model_type)],
+            inputs=[
+                _transforms.ShiftActions(
+                    action_horizon=model_config.action_horizon,
+                    shift_min=shift_min,
+                    shift_max=shift_max,
+                ),
+                kinova_policy.KinovaInputs(model_type=model_config.model_type),
+            ],
             outputs=[kinova_policy.KinovaOutputs()],
         ).push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -416,6 +460,8 @@ class LeRobotKinovaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             # Must match the actual dataset key (lerobot v2.1 uses "action", not "actions").
             action_sequence_keys=("action",),
+            # Fetch the extra future steps the interpolated shift needs (0 => unchanged fetch).
+            action_state_delay_fetch_extra=fetch_extra,
         )
 
 
@@ -1147,6 +1193,29 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    # pi0.5, rtc, clutter pick and place dataset, 15 steps (~2 epochs), command state delay augmentation
+    TrainConfig(
+        name="pi05_kinova_clutter_rtc",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10, mix_prob=0.0
+            # Compared to the first rtc run we increase the max delay to 10 in order for rtc to work with latencies up to 300 ms
+            # mix_prob is still 0 as we don't care abouth the HAS schedule implemented by the FASTER authors and we only want the vanilla RTC
+        ),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_clutter_pick_place",
+            action_state_delay_ms_min=140.0,
+            action_state_delay_ms_max=190.0,
+            # At VLA deployment, a reasonable compromise between command to state lag and motion smoothness lies in the range from 130 to
+            # 180 ms of latency, therefore we train the model on a slightly bigger range centered on our target deployment latency range
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,              # We increased the batch size from 32 to 64: given this is a much more varied and sparse dataset with a lot of distinct tasks, we hope this will result in each gradient step being more representative of the whole dataset distribution
+        num_train_steps=15_000,     # This is slightly less than 2 epochs for our dataset with ~490k frames, meaning that after 15k steps the model will have seen almost all frames 2 times
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),  # peak_lr default 2.5e-5; == num_train_steps so it anneals at the end
+        keep_period=1_000,
+        num_workers=8,
     ),
     # Full fine-tune, reuse ur5e pre-training norm stats.
     TrainConfig(
