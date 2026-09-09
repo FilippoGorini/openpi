@@ -1212,8 +1212,8 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         batch_size=64,              # We increased the batch size from 32 to 64: given this is a much more varied and sparse dataset with a lot of distinct tasks, we hope this will result in each gradient step being more representative of the whole dataset distribution
-        num_train_steps=15_000,     # This is slightly less than 2 epochs for our dataset with ~490k frames, meaning that after 15k steps the model will have seen almost all frames 2 times
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),  # peak_lr default 2.5e-5; == num_train_steps so it anneals at the end
+        num_train_steps=15_001,     # This is slightly less than 2 epochs for our dataset with ~490k frames, meaning that after 15k steps the model will have seen almost all frames 2 times
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),  # peak_lr default 2.5e-5
         keep_period=1_000,
         num_workers=8,
     ),
