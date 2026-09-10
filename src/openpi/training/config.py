@@ -1213,9 +1213,10 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         batch_size=64,              # We increased the batch size from 32 to 64: given this is a much more varied and sparse dataset with a lot of distinct tasks, we hope this will result in each gradient step being more representative of the whole dataset distribution
         num_train_steps=15_001,     # This is slightly less than 2 epochs for our dataset with ~490k frames, meaning that after 15k steps the model will have seen almost all frames 2 times
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),  # peak_lr default 2.5e-5
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000, warmup_steps=500),  # peak_lr default 2.5e-5: warmup halved from 1000 to 500 to match the b64/15k run (fewer total steps and 2x samples/step: 1000 was a bigger fraction of the run)
         keep_period=1_000,
         num_workers=8,
+        log_interval=50,            # finer loss resolution than the default 100
     ),
     # Full fine-tune, reuse ur5e pre-training norm stats.
     TrainConfig(
