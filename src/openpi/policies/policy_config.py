@@ -43,7 +43,9 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    # Serving only needs params/ and assets/; skip the optimizer state (train_state/) so it is never
+    # pulled from the remote checkpoint. No-op for local checkpoint dirs (download short-circuits).
+    checkpoint_dir = download.maybe_download(str(checkpoint_dir), ignore_patterns=("train_state/*",))
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")

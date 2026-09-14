@@ -1,5 +1,7 @@
+import collections.abc
 import concurrent.futures
 import datetime
+import fnmatch
 import logging
 import os
 import pathlib
@@ -29,7 +31,13 @@ def get_cache_dir() -> pathlib.Path:
     return cache_dir
 
 
-def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathlib.Path:
+def maybe_download(
+    url: str,
+    *,
+    force_download: bool = False,
+    ignore_patterns: collections.abc.Sequence[str] | None = None,
+    **kwargs,
+) -> pathlib.Path:
     """Download a file or directory from a remote filesystem to the local cache, and return the local path.
 
     If the local file already exists, it will be returned directly.
@@ -40,6 +48,9 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
     Args:
         url: URL to the file to download.
         force_download: If True, the file will be downloaded even if it already exists in the cache.
+        ignore_patterns: Optional glob patterns (matched against each file's path relative to `url`) that
+            will be skipped when downloading a directory, e.g. `("train_state/*",)` to avoid pulling the
+            optimizer state that is not needed for inference. Ignored for single-file downloads.
         **kwargs: Additional arguments to pass to fsspec.
 
     Returns:
@@ -87,10 +98,12 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
                 scratch_path = local_path.with_suffix(".partial")
                 # Route openpi-assets through gsutil to avoid gcsfs auth issues with this bucket.
                 # All other gs:// URLs (e.g. big_vision) continue to use gcsfs as normal.
-                if parsed.scheme == "gs" and parsed.netloc == "openpi-assets":
+                # gsutil cp has no per-file exclude, so fall back to the fsspec path when the caller
+                # asked to skip some files.
+                if parsed.scheme == "gs" and parsed.netloc == "openpi-assets" and not ignore_patterns:
                     _download_gsutil(url, scratch_path, **kwargs)
                 else:
-                    _download_fsspec(url, scratch_path, **kwargs)
+                    _download_fsspec(url, scratch_path, ignore_patterns=ignore_patterns, **kwargs)
 
                 shutil.move(scratch_path, local_path)
                 _ensure_permissions(local_path)
@@ -120,20 +133,40 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
     )
 
 
-def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
+def _download_fsspec(
+    url: str,
+    local_path: pathlib.Path,
+    *,
+    ignore_patterns: collections.abc.Sequence[str] | None = None,
+    **kwargs,
+) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""
-    fs, _ = fsspec.core.url_to_fs(url, **kwargs)
+    fs, root = fsspec.core.url_to_fs(url, **kwargs)
     info = fs.info(url)
     # Folders are represented by 0-byte objects with a trailing forward slash.
-    if is_dir := (info["type"] == "directory" or (info["size"] == 0 and info["name"].endswith("/"))):
-        total_size = fs.du(url)
+    is_dir = info["type"] == "directory" or (info["size"] == 0 and info["name"].endswith("/"))
+
+    # When filtering a directory, enumerate the files ourselves and fetch only the ones we keep,
+    # so ignored subtrees (e.g. train_state/) are never transferred over the network.
+    if is_dir and ignore_patterns:
+        rpaths, lpaths, total_size = _plan_filtered_get(fs, url, root, local_path, ignore_patterns)
+        if not rpaths:
+            local_path.mkdir(parents=True, exist_ok=True)
+            return
+        for lp in lpaths:
+            pathlib.Path(lp).parent.mkdir(parents=True, exist_ok=True)
+        get_args = (rpaths, lpaths)
+        get_kwargs = {}
     else:
-        total_size = info["size"]
-    with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        total_size = fs.du(url) if is_dir else info["size"]
         # Pass a str target: some fsspec backends (e.g. HfFileSystem for hf://) reject a
         # pathlib.Path local target and raise inside the worker thread.
-        future = executor.submit(fs.get, url, str(local_path), recursive=is_dir)
+        get_args = (url, str(local_path))
+        get_kwargs = {"recursive": is_dir}
+
+    with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fs.get, *get_args, **get_kwargs)
         while not future.done():
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
@@ -142,6 +175,32 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
         # swallowed here and only shows up later as a misleading FileNotFoundError on move.
         future.result()
         pbar.update(total_size - pbar.n)
+
+
+def _plan_filtered_get(
+    fs, url: str, root: str, local_path: pathlib.Path, ignore_patterns: collections.abc.Sequence[str]
+) -> tuple[list[str], list[str], int]:
+    """List the files under `url`, drop those matching `ignore_patterns`, and return the paired
+    (remote paths, local paths, total size in bytes) for the files that should be downloaded.
+
+    Patterns are matched with `fnmatch` against each file's path relative to `url` (POSIX separators),
+    so `*` also matches `/` (e.g. `train_state/*` skips the whole train_state subtree).
+    """
+    # detail=True avoids a size() round-trip per file for the progress bar.
+    detail = fs.find(url, withdirs=False, detail=True)
+    root_prefix = root.rstrip("/") + "/"
+
+    rpaths: list[str] = []
+    lpaths: list[str] = []
+    total_size = 0
+    for remote_path, entry in detail.items():
+        rel = remote_path[len(root_prefix) :] if remote_path.startswith(root_prefix) else remote_path.lstrip("/")
+        if any(fnmatch.fnmatch(rel, pat) for pat in ignore_patterns):
+            continue
+        rpaths.append(remote_path)
+        lpaths.append(str(local_path / rel))
+        total_size += entry.get("size") or 0
+    return rpaths, lpaths, total_size
 
 
 def _set_permission(path: pathlib.Path, target_permission: int):
