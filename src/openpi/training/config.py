@@ -619,6 +619,8 @@ class TrainConfig:
     num_workers: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
+    # Added field to initialize the train_state.step at a value different from 0 (so that we can resume from 14k and keep saving with the global step without restarting from 0)
+    init_step: int = 0
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -1217,6 +1219,29 @@ _CONFIGS = [
         keep_period=1_000,
         num_workers=8,
         log_interval=50,            # finer loss resolution than the default 100
+    ),
+    # Resume config to get the 14k checkpoint to 16k (total 30k) with warmup
+    TrainConfig(
+        name="pi05_kinova_clutter_rtc_resume",
+        model=pi0_config.Pi0FasterConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10, mix_prob=0.0
+        ),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_clutter_pick_place",
+            action_state_delay_ms_min=140.0,
+            action_state_delay_ms_max=190.0,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("hf://FilippoGorini/pi05_kinova_clutter_rtc/14000/params"), # use 14k checkpoint as base model
+        batch_size=64,
+        num_train_steps=30_001,   
+        init_step=14_000,           # continue GLOBAL step numbering from the 14k checkpoint
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=16_000, warmup_steps=500),  # fresh warmup+cosine over the new 16k (0-based: driven by the optimizer count, NOT init_step)
+        save_interval=1_000,       
+        keep_period=1_000,         
+        num_workers=8,
+        log_interval=50,
+        # ema_decay defaults to 0.99 (EMA stays on, as you wanted)
     ),
     # Full fine-tune, reuse ur5e pre-training norm stats.
     TrainConfig(

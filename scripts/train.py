@@ -104,7 +104,7 @@ def init_train_state(
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
         return training_utils.TrainState(
-            step=0,
+            step=config.init_step,
             params=params,
             model_def=nnx.graphdef(model),
             tx=tx,
