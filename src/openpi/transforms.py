@@ -264,8 +264,8 @@ class ShiftActions(DataTransformFn):
     """Training-time augmentation for the action-to-state delay (measured state lags the command).
 
     Dataset has command == state (zero delay) but at inference the command leads the measured state
-    This transform advances the action window by a random delay `delta` (arm cols are linearly interpolated to the
-    fractional offset while the discrete gripper is floored) while the observation stays put, so after
+    This transform advances the arm action window by a random delay `delta` (linearly interpolated to the
+    fractional offset) while the observation stays put, so after
     `DeltaActions` action[0] is a future state (delta[0] ~= delta*v > 0) -- matching inference,
     including the RTC committed prefix.
 
@@ -305,9 +305,9 @@ class ShiftActions(DataTransformFn):
 
         m = int(np.floor(delta))
         f = delta - m
-        # Linearly interpolate the arm columns to the fractional offset and floor the discrete gripper
+        # Only the arm is shifted: its actions are copied states, while the gripper is the real teleop command
         arm = (1.0 - f) * actions[m : m + h, :6] + f * actions[m + 1 : m + 1 + h, :6]
-        gripper = actions[m : m + h, 6:]
+        gripper = actions[:h, 6:]
         data["actions"] = np.concatenate([arm, gripper], axis=1)
         return data
 
