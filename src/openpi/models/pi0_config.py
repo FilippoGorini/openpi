@@ -13,7 +13,7 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
-    from openpi.models.pi0_faster import Pi0Faster      # Additionally import the Pi0Faster model (the one with rtc)
+    from openpi.models.pi0_rtc import Pi0RTC      # Additionally import the Pi0RTC model (the one with rtc)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,9 +118,9 @@ class Pi0Config(_model.BaseModelConfig):
         return nnx.All(*filters)
 
 
-# New Pi0FasterConfig, taken from the FASTER repo 
+# Training-time RTC config, adapted from the FASTER repo (where it was Pi0FasterConfig)
 @dataclasses.dataclass(frozen=True)
-class Pi0FasterConfig(_model.BaseModelConfig):
+class Pi0RTCConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
@@ -136,11 +136,8 @@ class Pi0FasterConfig(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
-    # New config options for FASTER
+    # Training-time RTC: delays sampled from Unif[0, max_delay)
     max_delay: int = 10
-    mix_prob: float = 0.5
-    alpha: float = 0.6
-    u0: float = 0.9
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -156,10 +153,10 @@ class Pi0FasterConfig(_model.BaseModelConfig):
         return _model.ModelType.PI0
 
     @override
-    def create(self, rng: at.KeyArrayLike) -> "Pi0Faster":
-        from openpi.models.pi0_faster import Pi0Faster
+    def create(self, rng: at.KeyArrayLike) -> "Pi0RTC":
+        from openpi.models.pi0_rtc import Pi0RTC
 
-        return Pi0Faster(self, rngs=nnx.Rngs(rng))
+        return Pi0RTC(self, rngs=nnx.Rngs(rng))
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:

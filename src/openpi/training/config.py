@@ -135,8 +135,8 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05:
-                # widened assert to accept the Pi0FasterConfig with pi05=True
-                assert isinstance(model_config, pi0_config.Pi0Config | pi0_config.Pi0FasterConfig)
+                # widened assert to accept the Pi0RTCConfig with pi05=True
+                assert isinstance(model_config, pi0_config.Pi0Config | pi0_config.Pi0RTCConfig)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -1182,12 +1182,11 @@ _CONFIGS = [
     # Differently from the first run, in this we set the discrete_state_input=True, so that the model actually conditions on the state too
     # In fact, in the pi05 path, when this is false the state is not used for conditioning anywhere, not discrete, not continuous (as pi0 does instead)
     # On the 5090 cloud GPU server full roundtrip latency is on average ~140 ms ---> 4/5 steps at 30 Hz control rate
-    # Therefore, we set the max_delay on a conservative 8: during training the model learns to counteract latencies anywhere from 0 to 8 steps 
-    # We set instead mix_prob=0.0 to skip the HAS scheduling introduced by the FASTER paper and use a constant scheduling instead: while the faster reaction times are nice, our focus is on simpler less dynamic tasks
+    # Therefore, we set the max_delay on a conservative 8: during training the model learns to counteract latencies anywhere from 0 to 7 steps (randint excludes max_delay)
     TrainConfig(
         name="pi05_kinova_finetune_rtc",
-        model=pi0_config.Pi0FasterConfig(
-            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=8, mix_prob=0.0
+        model=pi0_config.Pi0RTCConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=8
         ),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_joint_cubelift_v01",
@@ -1199,10 +1198,9 @@ _CONFIGS = [
     # pi0.5, rtc, clutter pick and place dataset, 15 steps (~2 epochs), command state delay augmentation
     TrainConfig(
         name="pi05_kinova_clutter_rtc",
-        model=pi0_config.Pi0FasterConfig(
-            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10, mix_prob=0.0
+        model=pi0_config.Pi0RTCConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10
             # Compared to the first rtc run we increase the max delay to 10 in order for rtc to work with latencies up to 300 ms
-            # mix_prob is still 0 as we don't care abouth the HAS schedule implemented by the FASTER authors and we only want the vanilla RTC
         ),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_clutter_pick_place",
@@ -1223,8 +1221,8 @@ _CONFIGS = [
     # Resume config to get the 14k checkpoint to 16k (total 30k) with warmup
     TrainConfig(
         name="pi05_kinova_clutter_rtc_resume",
-        model=pi0_config.Pi0FasterConfig(
-            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10, mix_prob=0.0
+        model=pi0_config.Pi0RTCConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10
         ),
         data=LeRobotKinovaDataConfig(
             repo_id="FilippoGorini/vla_kinova_gen3_clutter_pick_place",

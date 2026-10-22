@@ -61,16 +61,10 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup. RTC models (Pi0Faster) use jax.lax.scan(length=num_steps) and a static
-            # `infer_time_schedule` string, so those must be static args; the base Pi0 has neither and
-            # keeps its dynamic num_steps. Only mark static the args the method actually accepts, so the
-            # non-RTC path is unchanged.
-            sig_params = inspect.signature(model.sample_actions).parameters
-            if "infer_time_schedule" in sig_params:
-                static_argnames = tuple(
-                    n for n in ("num_steps", "infer_time_schedule", "alpha", "u0") if n in sig_params
-                )
-                self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=static_argnames)
+            # JAX model setup. RTC models (Pi0RTC) use jax.lax.scan(length=num_steps), so num_steps must be
+            # static; the base Pi0 keeps its dynamic num_steps, so the non-RTC path is unchanged.
+            if "action_prefix" in inspect.signature(model.sample_actions).parameters:
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_steps",))
             else:
                 self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
