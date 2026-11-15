@@ -246,7 +246,7 @@ def _batches(args, rows, data, cfg, prompt_of):
 
     dc = cfg.data.create(cfg.assets_dirs, cfg.model)
     tf = _transforms.compose(dc.model_transforms.inputs)
-    cams = sorted({k.split("/")[1] for k in data.files if k.startswith("image/")})
+    cams = sorted({k.split("/")[1] for k in data if k.startswith("image/")})
     for s in range(0, len(rows), args.batch):
         chunk = rows[s : s + args.batch]
         chunk = chunk + [chunk[-1]] * (args.batch - len(chunk))  # fixed batch: one compile
@@ -283,7 +283,7 @@ def loss(args: Loss) -> None:
 
     sdir = pathlib.Path(args.samples)
     rows = json.loads((sdir / "samples.json").read_text())["samples"]
-    data = np.load(sdir / "samples.npz")
+    data = dict(np.load(sdir / "samples.npz"))  # NpzFile re-reads (decompresses) the whole array on every access
     cfg, model = _load(args.checkpoint, args.config)
     graphdef, state = nnx.split(model)
     n_dims = data["actions"].shape[-1]  # real action dims; the rest is padding
@@ -361,7 +361,7 @@ def features(args: Features) -> None:
 
     sdir = pathlib.Path(args.samples)
     rows = [r for r in json.loads((sdir / "samples.json").read_text())["samples"] if r["phase"] == "carry"]
-    data = np.load(sdir / "samples.npz")
+    data = dict(np.load(sdir / "samples.npz"))  # NpzFile re-reads (decompresses) the whole array on every access
     cfg, model = _load(args.checkpoint, args.config)
     graphdef, state = nnx.split(model)
 
