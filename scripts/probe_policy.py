@@ -290,20 +290,38 @@ def loss(args: Loss) -> None:
 
     @jax.jit
     def per_sample(state, obs, actions, noise, time):
-        """Pi0RTC.compute_loss without the RTC prefix (delay 0), per sample, on the real action dims."""
+        """Pi0RTC.compute_loss without the RTC prefix (delay 0), per sample and draw, on the real action dims.
+
+        The prefix (images + prompt) never attends to the suffix, so its KV cache is computed once and shared by all
+        draws, as in sample_actions. noise (b, draws, ah, ad), time (b, draws) -> loss (b, draws)."""
         m = nnx.merge(graphdef, state)
         obs = _model.preprocess_observation(None, obs, train=False)
-        t = jnp.broadcast_to(time[:, None], actions.shape[:2])
-        x_t = t[..., None] * noise + (1 - t[..., None]) * actions
         pre, pre_mask, pre_ar = m.embed_prefix(obs)
-        suf, suf_mask, suf_ar, cond = m.embed_suffix(obs, x_t, t)
-        mask = jnp.concatenate([pre_mask, suf_mask], axis=1)
-        ar = jnp.concatenate([pre_ar, suf_ar], axis=0)
-        (_, out), _ = m.PaliGemma.llm(
-            [pre, suf], mask=make_attn_mask(mask, ar), positions=jnp.cumsum(mask, axis=1) - 1, adarms_cond=[None, cond]
+        _, kv = m.PaliGemma.llm(
+            [pre, None], mask=make_attn_mask(pre_mask, pre_ar), positions=jnp.cumsum(pre_mask, 1) - 1
         )
-        v_t = m.action_out_proj(out[:, -m.action_horizon :])
-        return jnp.mean(jnp.square(v_t - (noise - actions))[..., :n_dims], axis=(1, 2))
+
+        def draw(nt):
+            noise, time = nt
+            t = jnp.broadcast_to(time[:, None], actions.shape[:2])
+            x_t = t[..., None] * noise + (1 - t[..., None]) * actions
+            suf, suf_mask, suf_ar, cond = m.embed_suffix(obs, x_t, t)
+            s = suf.shape[1]
+            mask = jnp.concatenate(
+                [
+                    jnp.broadcast_to(pre_mask[:, None], (len(pre_mask), s, pre_mask.shape[1])),
+                    make_attn_mask(suf_mask, suf_ar),
+                ],
+                axis=-1,
+            )
+            positions = jnp.sum(pre_mask, axis=-1)[:, None] + jnp.cumsum(suf_mask, axis=-1) - 1
+            (_, out), _ = m.PaliGemma.llm(
+                [None, suf], mask=mask, positions=positions, kv_cache=kv, adarms_cond=[None, cond]
+            )
+            v_t = m.action_out_proj(out[:, -m.action_horizon :])
+            return jnp.mean(jnp.square(v_t - (noise - actions))[..., :n_dims], axis=(1, 2))
+
+        return jax.lax.map(draw, (noise.swapaxes(0, 1), time.T)).T
 
     # One (noise, time) set per sample and draw, from the sample index: identical for every variant and checkpoint.
     ah, ad = cfg.model.action_horizon, cfg.model.action_dim
@@ -321,9 +339,7 @@ def loss(args: Loss) -> None:
         for n, obs, actions in _batches(args, sel, data, cfg, lambda r, name=name: (r["variants"][name], None)):
             ids = [r["i"] for r in sel[done : done + n]]
             ids += [ids[-1]] * (args.batch - n)
-            losses = np.zeros((args.batch, args.draws))
-            for d in range(args.draws):
-                losses[:, d] = per_sample(state, obs, jnp.asarray(actions), noise[ids, d], time[ids, d])
+            losses = np.asarray(per_sample(state, obs, jnp.asarray(actions), noise[ids], time[ids]))
             for j, i in enumerate(ids[:n]):
                 result[i][name] = float(losses[j].mean())
             done += n
