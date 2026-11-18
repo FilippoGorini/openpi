@@ -2,10 +2,11 @@
 
 Works on training frames, passed through the exact training transforms. Three steps:
 
-    # 1. Laptop (CPU, has the dataset): pick 2 frames per episode (one while reaching, one while carrying), save them
-    #    after the training data transforms, and write the prompt variants for each frame.
+    # 1. Laptop (CPU, has the dataset): keep the episodes whose phases are clear from the gripper (see `windows`),
+    #    take 5 equally spaced frames while reaching and 5 while carrying, save them after the training data
+    #    transforms, and write the prompt variants for each frame.
     uv run scripts/probe_policy.py extract --root ~/datasets/FilippoGorini/vla_kinova_gen3_clutter_pick_place@v2.1 \
-        --out ../../analysis/backbone_probe/policy
+        --out ../../analysis/backbone_probe/policy_5f
 
     # 2. GPU, one checkpoint per process:
     #    loss:     flow-matching loss of the recorded actions under each prompt variant, with the same noise and
@@ -13,10 +14,11 @@ Works on training frames, passed through the exact training transforms. Three st
     #              much the actions depend on the edited words;
     #    features: V of every backbone layer (what the action expert attends to) and the SigLIP output, mean-pooled
     #              per camera, on the carrying frames with an empty task and a fixed state (no text information).
-    uv run scripts/probe_policy.py loss --checkpoint hf://FilippoGorini/pi05_kinova_clutter_rtc/30000 --name 30k \
-        --samples ../../analysis/backbone_probe/policy
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/probe_policy.py loss \
+        --checkpoint hf://FilippoGorini/pi05_kinova_clutter_rtc/30000 --name 30k \
+        --samples ../../analysis/backbone_probe/policy_5f --draws 16
     uv run scripts/probe_policy.py features --checkpoint hf://FilippoGorini/pi05_kinova_clutter_rtc/30000 --name 30k \
-        --samples ../../analysis/backbone_probe/policy
+        --samples ../../analysis/backbone_probe/policy_5f
 
     # 3. Laptop: analysis/backbone_probe/analyze_policy.py (loss table, linear probe of the held object per layer).
 
@@ -29,6 +31,7 @@ import logging
 import pathlib
 import random
 import re
+from time import monotonic
 
 import numpy as np
 import tyro
@@ -47,6 +50,8 @@ PUT = re.compile(
     r"^(?P<verb>put|place) (?P<art>the )(?P<obj>.+?) (?P<where>(?P<prep>in|on top of|on|over) the (?P<dest>.+))$"
 )
 OBJ = re.compile(rf"^(?:(?P<colour>{_COL}(?: and {_COL})?) )?(?P<noun>[a-z\- ]+)$")
+# Prompts where the first object grasped is often a blocker, not the named one.
+BLOCKED = re.compile(r"\b(under|over|on top of|behind)\b")
 OTHER_VERB = {"pick up": "grab", "pick": "grab", "grab": "take", "take": "pick", "get": "pick", "put": "place",
               "place": "put"}  # fmt: skip
 
@@ -91,6 +96,34 @@ def variants(prompt: str, vocab: dict, rng: random.Random) -> dict[str, str]:
     return out
 
 
+def windows(action: np.ndarray, state: np.ndarray, args: "Extract") -> dict | None:
+    """Reach and carry windows (start, end) of one episode, or None when its phases are not clear from the gripper.
+
+    The first gripper close must be the only one that holds an object (closed > 40 frames, finger position below
+    `empty` after closing) and the longest one, so a deformable or a regrasp cannot be mistaken for it.
+    Reach = motion onset to that close; carry = fingers settled on the object (95% of their held position) to
+    release. Motion onset is the first active frame of
+    `lerobot-doctor trim` (mean |action change| over all dims above `activity`), the rule that cut the head of the
+    _trimmed dataset."""
+    closed = action[:, -1] > args.closed
+    edges = np.flatnonzero(np.diff(closed.astype(int)))  # 0->1 and 1->0 switches
+    starts, ends = [e + 1 for e in edges if not closed[e]], [e + 1 for e in edges if closed[e]]
+    closes = [(s, next((e for e in ends if e > s), len(closed))) for s in starts]
+    if not closes:
+        return None
+    held = [b - a > 40 and np.median(state[a + 15 : b, -1]) < args.empty for a, b in closes]
+    if not held[0] or sum(held) > 1 or max(closes, key=lambda c: c[1] - c[0]) != closes[0]:
+        return None
+    activity = np.concatenate([[0.0], np.abs(np.diff(action, axis=0)).mean(axis=1)])
+    activity[0] = activity[1]
+    onset = int(np.argmax(activity > args.activity))
+    if onset >= closes[0][0]:
+        return None
+    (a, b), finger = closes[0], state[:, -1]
+    settled = a + int(np.argmax(finger[a:b] >= 0.95 * np.median(finger[a + 15 : b])))
+    return {"reach": (onset, a), "carry": (settled, b)}
+
+
 def make_vocab(prompts) -> dict:
     """Nouns of plain object descriptions, and destinations of pick-and-place tasks (not stacking ones)."""
     parsed = [(t, p) for t in prompts if (p := parse(t))]
@@ -111,6 +144,12 @@ class Extract:
     seed: int = 0
     # Gripper command above this = closed (commands are 0.0 / 0.8).
     closed: float = 0.4
+    # Finger position above this = closed on nothing (fully closed reads ~0.78-0.80).
+    empty: float = 0.775
+    # Motion onset threshold, as `lerobot-doctor trim --threshold` for the _trimmed dataset.
+    activity: float = 0.0003
+    # Frames per phase, at the centres of equal slices of the window.
+    frames: int = 5
     # Only print the variants of every task in the dataset, extract nothing.
     prompts_only: bool = False
 
@@ -177,27 +216,26 @@ def extract(args: Extract) -> None:
         ]
     )
 
-    actions = np.asarray(ds.hf_dataset.with_format("numpy")["action"])
-    episodes = np.asarray(ds.hf_dataset.with_format("numpy")["episode_index"])
-    rng, np_seed = random.Random(args.seed), np.random.default_rng(args.seed)
+    hf = ds.hf_dataset.with_format("numpy")
+    actions, states = np.asarray(hf["action"]), np.asarray(hf["observation.state"])
+    episodes, task_ids = np.asarray(hf["episode_index"]), np.asarray(hf["task_index"])
+    rng = random.Random(args.seed)
     np.random.seed(args.seed)  # ShiftActions draws its delay from the global numpy RNG
-    picks = []
+    picks, kept = [], []
     for ep in np.unique(episodes):
         idx = np.flatnonzero(episodes == ep)
-        closed = actions[idx, -1] > args.closed
-        edges = np.flatnonzero(np.diff(closed.astype(int)))  # 0->1 and 1->0 switches
-        starts, ends = [e + 1 for e in edges if not closed[e]], [e + 1 for e in edges if closed[e]]
-        if not starts:
+        w = windows(actions[idx], states[idx], args)
+        if w is None or BLOCKED.search(meta.tasks[int(task_ids[idx[0]])]):
             continue
-        g0 = starts[0]
-        picks.append((int(idx[int(np_seed.uniform(0.2, 0.8) * g0)]), "reach"))
-        # Carry = the longest closed interval (skips failed grasps before a retry), away from its edges.
-        a, b = max(((s, next((e for e in ends if e > s), len(idx))) for s in starts), key=lambda x: x[1] - x[0])
-        if b - a > 40:
-            picks.append((int(idx[rng.randint(a + 15, b - 15)]), "carry"))
+        kept.append(int(ep))
+        for phase, (a, b) in w.items():
+            for k in range(args.frames):
+                f = a + int((k + 0.5) * (b - a) / args.frames)
+                picks.append((int(idx[f]), phase, int(f)))
+    logging.info("%d of %d episodes kept, %d frames", len(kept), len(np.unique(episodes)), len(picks))
 
     rows, arrays = [], {}
-    for i, (index, phase) in enumerate(picks):
+    for i, (index, phase, frame) in enumerate(picks):
         x = transform(ds[index])
         for k in ("state", "actions"):
             arrays.setdefault(k, []).append(np.asarray(x[k], np.float32))
@@ -206,7 +244,7 @@ def extract(args: Extract) -> None:
             arrays.setdefault(f"image_mask/{cam}", []).append(np.asarray(x["image_mask"][cam]))
         prompt = str(x["prompt"])
         rows.append(
-            {"i": i, "index": index, "episode": int(episodes[index]), "phase": phase, "prompt": prompt}
+            {"i": i, "index": index, "episode": int(episodes[index]), "frame": frame, "phase": phase, "prompt": prompt}
             | {"parse": parse(prompt), "variants": variants(prompt, vocab, rng)}
         )
         if i % 100 == 0:
@@ -215,7 +253,7 @@ def extract(args: Extract) -> None:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out / "samples.npz", **{k: np.stack(v) for k, v in arrays.items()})
-    (out / "samples.json").write_text(json.dumps({"vocab": vocab, "samples": rows}, indent=1))
+    (out / "samples.json").write_text(json.dumps({"vocab": vocab, "episodes": kept, "samples": rows}, indent=1))
     logging.info("%d samples (%d carry) in %s", len(rows), sum(r["phase"] == "carry" for r in rows), out)
 
 
@@ -333,6 +371,7 @@ def loss(args: Loss) -> None:
 
     names = sorted({v for r in rows for v in r["variants"]})
     result = {r["i"]: {} for r in rows}
+    total, seen, nb, t0 = sum(name in r["variants"] for r in rows for name in names), 0, 0, monotonic()
     for name in names:
         sel = [r for r in rows if name in r["variants"]]
         done = 0
@@ -343,6 +382,10 @@ def loss(args: Loss) -> None:
             for j, i in enumerate(ids[:n]):
                 result[i][name] = float(losses[j].mean())
             done += n
+            seen, nb = seen + n, nb + 1
+            if nb % 20 == 1:
+                spent = (monotonic() - t0) / 60
+                logging.info("%d/%d: %.0f min spent, ~%.0f min left", seen, total, spent, spent * (total - seen) / seen)
         logging.info("%s: %d samples, mean loss %.4f", name, len(sel), np.mean([result[r["i"]][name] for r in sel]))
 
     out = sdir / "results" / args.name
