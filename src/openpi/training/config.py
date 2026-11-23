@@ -1241,6 +1241,28 @@ _CONFIGS = [
         log_interval=50,
         # ema_decay defaults to 0.99 (EMA stays on, as you wanted)
     ),
+    # v2: same model and augmentation as pi05_kinova_clutter_rtc, on the v2 dataset (v1 episodes trimmed, relabelled
+    # and duplicated into copies A/B/C: 1257 episodes, 877,202 frames). One warmup+cosine schedule instead of 14k + 16k resume
+    TrainConfig(
+        name="pi05_kinova_clutter_rtc_v2",
+        model=pi0_config.Pi0RTCConfig(
+            pi05=True, action_horizon=30, discrete_state_input=True, max_delay=10
+        ),
+        data=LeRobotKinovaDataConfig(
+            repo_id="FilippoGorini/vla_kinova_gen3_clutter_pick_place_v2",
+            action_state_delay_ms_min=140.0,
+            action_state_delay_ms_max=190.0,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        num_train_steps=55_001,     # ~4 epochs (55k * 64 / 877,202 = 4.01), about as many as v1 (30k * 64 / 490,147 = 3.92)
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=55_000, warmup_steps=500),  # as v1: warmup only has to cover the first steps from the pretrained weights, not a share of the run
+        save_interval=1_000,
+        keep_period=5_000,          # 11 kept checkpoints * ~50 GB; keeping every 1k would be ~2.75 TB
+        num_workers=8,
+        log_interval=50,
+    ),
     # Full fine-tune, reuse ur5e pre-training norm stats.
     TrainConfig(
         name="pi05_kinova_finetune_ur5e",
