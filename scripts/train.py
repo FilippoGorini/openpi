@@ -217,10 +217,16 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # Step s trains on batch s - init_step, and checkpoint s holds train_state.step == s + 1, so a resumed run
+    # continues the data order by skipping the batches already used (checked against the restored step below).
+    skip_batches = checkpoint_manager.latest_step() + 1 - config.init_step if resuming else 0
+    if resuming:
+        logging.info(f"Resuming data order: skipping {skip_batches} batches")
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
+        skip_batches=skip_batches,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -239,6 +245,11 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        if int(train_state.step) - config.init_step != skip_batches:
+            raise ValueError(
+                f"Restored step {int(train_state.step)} does not match the {skip_batches} skipped batches "
+                f"(init_step={config.init_step})."
+            )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),

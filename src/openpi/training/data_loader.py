@@ -233,6 +233,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    skip_batches: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -243,11 +244,14 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        skip_batches: Number of batches to skip at the start (torch loader only), to resume the data order.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if skip_batches:
+            raise NotImplementedError("skip_batches is not supported by the RLDS data loader")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -270,6 +274,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        skip_batches=skip_batches,
     )
 
 
@@ -286,6 +291,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    skip_batches: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -303,6 +309,7 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        skip_batches: Number of batches to skip at the start, see TorchDataLoader.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -337,6 +344,7 @@ def create_torch_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+        skip_batches=skip_batches,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -398,6 +406,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        skip_batches: int = 0,
     ):
         """Create a PyTorch data loader.
 
@@ -413,6 +422,9 @@ class TorchDataLoader:
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
+            skip_batches: Number of batches to skip at the start (shuffle only). The loader then yields exactly
+                the batches an unskipped loader with the same seed yields from batch `skip_batches` on, so a resumed
+                run sees the same data order as an uninterrupted one. Only indices are drawn for skipped batches.
         """
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
@@ -436,17 +448,37 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        if skip_batches > 0:
+            if sampler is not None or not shuffle:
+                raise ValueError("skip_batches is only supported with shuffle=True and no sampler.")
+            # Same samplers that DataLoader(shuffle=True, drop_last=True) builds internally, sharing `generator`.
+            batching = {
+                "batch_sampler": _SkipBatches(
+                    torch.utils.data.BatchSampler(
+                        torch.utils.data.RandomSampler(dataset, generator=generator),
+                        local_batch_size,
+                        drop_last=True,
+                    ),
+                    skip_batches,
+                    # Without persistent workers DataLoader builds a new iterator, drawing a new base seed, per epoch.
+                    epoch_seed_generator=generator if num_workers == 0 else None,
+                )
+            }
+        else:
+            batching = {
+                "batch_size": local_batch_size,
+                "shuffle": (sampler is None and shuffle),  # Don't shuffle if using sampler
+                "sampler": sampler,
+                "drop_last": True,
+            }
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
+            **batching,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
             generator=generator,
         )
 
@@ -471,6 +503,42 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+
+
+class _SkipBatches(torch.utils.data.Sampler):
+    """Wraps a batch sampler and drops its first `skip` batches, rolling over epochs if needed.
+
+    Only the first iteration skips; later epochs are full. `__iter__` must stay a lazy generator: DataLoader calls
+    `iter()` on it before drawing its worker base seed, and the generator draws must come after that seed as they do
+    in an unskipped loader. If `epoch_seed_generator` is set, each skipped epoch also consumes the base seed that
+    DataLoader draws from it when it starts the next epoch.
+    """
+
+    def __init__(
+        self,
+        batch_sampler: torch.utils.data.BatchSampler,
+        skip: int,
+        epoch_seed_generator: torch.Generator | None = None,
+    ):
+        self._batch_sampler = batch_sampler
+        self._skip = skip
+        self._epoch_seed_generator = epoch_seed_generator
+
+    def __iter__(self):
+        skip, self._skip = self._skip, 0
+        it = iter(self._batch_sampler)
+        while skip > 0:
+            if next(it, None) is None:
+                # Whole epoch skipped, continue into the next one.
+                if self._epoch_seed_generator is not None:
+                    torch.empty((), dtype=torch.int64).random_(generator=self._epoch_seed_generator)
+                it = iter(self._batch_sampler)
+            else:
+                skip -= 1
+        yield from it
+
+    def __len__(self) -> int:
+        return len(self._batch_sampler)
 
 
 def _collate_fn(items):
