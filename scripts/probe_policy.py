@@ -14,9 +14,9 @@ Works on training frames, passed through the exact training transforms. Three st
     #              much the actions depend on the edited words;
     #    features: V of every backbone layer (what the action expert attends to) and the SigLIP output, mean-pooled
     #              per camera, on the carrying frames with an empty task and a fixed state (no text information).
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/probe_policy.py loss \
+    XLA_FLAGS=--xla_gpu_autotune_level=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/probe_policy.py loss \
         --checkpoint hf://FilippoGorini/pi05_kinova_clutter_rtc/30000 --name 30k \
-        --samples ../../analysis/backbone_probe/policy_5f --draws 16
+        --samples ../../analysis/backbone_probe/policy_5f --draws 16 --batch 16
     uv run scripts/probe_policy.py features --checkpoint hf://FilippoGorini/pi05_kinova_clutter_rtc/30000 --name 30k \
         --samples ../../analysis/backbone_probe/policy_5f
 
@@ -25,6 +25,7 @@ Works on training frames, passed through the exact training transforms. Three st
 pi05_base was never trained on this robot, so its loss numbers are not comparable: use it for `features` only.
 """
 
+import csv
 import dataclasses
 import json
 import logging
@@ -37,7 +38,7 @@ import numpy as np
 import tyro
 
 COLOURS = ["red", "green", "blue", "black", "yellow", "pink", "purple", "white", "orange", "grey", "brown",
-           "light-blue", "clear", "transparent"]  # fmt: skip
+           "light-blue", "clear", "transparent", "light blue"]  # fmt: skip  (v2 spelling last: swaps use [:11])
 _COL = "(?:" + "|".join(COLOURS) + ")"
 # Words that make an object description depend on the scene (position, size, function): not swapped.
 RELATIONAL = {"leftmost", "rightmost", "closest", "smaller", "smallest", "bigger", "big", "small", "next", "behind",
@@ -152,6 +153,11 @@ class Extract:
     frames: int = 5
     # Only print the variants of every task in the dataset, extract nothing.
     prompts_only: bool = False
+    # TSV with one prompt per episode (columns `episode` and `prompt_column`) used instead of the dataset's task, and
+    # for the swap vocabulary; frames and episode selection still come from the dataset. E.g. the v2 copy-A prompts
+    # (~/datasets/v2_build/v2_prompt_copies.tsv, column A) on the v1 frames, to probe v2 in its training spelling.
+    prompts: str = ""
+    prompt_column: str = "A"
 
 
 @dataclasses.dataclass
@@ -188,6 +194,11 @@ def extract(args: Extract) -> None:
 
     root = pathlib.Path(args.root).expanduser()
     tasks = [json.loads(line)["task"] for line in (root / "meta" / "tasks.jsonl").read_text().splitlines()]
+    prompt_of = {}
+    if args.prompts:
+        with open(pathlib.Path(args.prompts).expanduser()) as f:
+            prompt_of = {int(r["episode"]): r[args.prompt_column] for r in csv.DictReader(f, delimiter="\t")}
+        tasks = sorted(set(prompt_of.values()))
     vocab = make_vocab(tasks)
     if args.prompts_only:
         rng = random.Random(args.seed)
@@ -242,7 +253,7 @@ def extract(args: Extract) -> None:
         for cam, img in x["image"].items():
             arrays.setdefault(f"image/{cam}", []).append(np.asarray(img))
             arrays.setdefault(f"image_mask/{cam}", []).append(np.asarray(x["image_mask"][cam]))
-        prompt = str(x["prompt"])
+        prompt = prompt_of[int(episodes[index])] if prompt_of else str(x["prompt"])
         rows.append(
             {"i": i, "index": index, "episode": int(episodes[index]), "frame": frame, "phase": phase, "prompt": prompt}
             | {"parse": parse(prompt), "variants": variants(prompt, vocab, rng)}
